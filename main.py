@@ -17,7 +17,6 @@ import os
 import hashlib
 import joblib
 import numpy as np
-import pandas as pd
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 
@@ -57,12 +56,7 @@ app = FastAPI(
 
 # ── Esquema de entrada ─────────────────────────────────────────────────────────
 class Transaction(BaseModel):
-    """
-    Las variables V1-V28 son componentes principales (PCA).
-    Desde la perspectiva de Ecuaciones Diferenciales, el vector
-    [V1..V28, Time, Amount] define el estado del sistema en t=Time.
-    """
-    Time:   float = Field(..., description="Segundos desde la primera transacción del dataset")
+    Time:   float = Field(..., description="Segundos desde la primera transacción")
     Amount: float = Field(..., ge=0, description="Monto de la transacción en USD")
     V1:  float; V2:  float; V3:  float; V4:  float
     V5:  float; V6:  float; V7:  float; V8:  float
@@ -75,44 +69,31 @@ class Transaction(BaseModel):
 
 # ── Utilidades ─────────────────────────────────────────────────────────────────
 def compute_audit_hash(tx: Transaction, prediction: int, ts: datetime) -> str:
-    """
-    Genera SHA-256 concatenando todos los campos críticos.
-    Seguridad de BD: el hash actúa como firma digital del registro.
-    Si alguien modifica 'prediction' en la DB, el hash ya no coincide.
-    """
+    """SHA-256 sobre todos los campos — Seguridad de BD."""
     raw = (
-        f"{ts.isoformat()}"
-        f"{tx.Time}{tx.Amount}{tx.V1}{tx.V2}{tx.V3}{tx.V4}"
-        f"{tx.V5}{tx.V6}{tx.V7}{tx.V8}{tx.V9}{tx.V10}"
-        f"{tx.V11}{tx.V12}{tx.V13}{tx.V14}{tx.V15}{tx.V16}"
-        f"{tx.V17}{tx.V18}{tx.V19}{tx.V20}{tx.V21}{tx.V22}"
-        f"{tx.V23}{tx.V24}{tx.V25}{tx.V26}{tx.V27}{tx.V28}"
+        f"{ts.isoformat()}{tx.Time}{tx.Amount}"
+        f"{tx.V1}{tx.V2}{tx.V3}{tx.V4}{tx.V5}{tx.V6}{tx.V7}"
+        f"{tx.V8}{tx.V9}{tx.V10}{tx.V11}{tx.V12}{tx.V13}{tx.V14}"
+        f"{tx.V15}{tx.V16}{tx.V17}{tx.V18}{tx.V19}{tx.V20}{tx.V21}"
+        f"{tx.V22}{tx.V23}{tx.V24}{tx.V25}{tx.V26}{tx.V27}{tx.V28}"
         f"{prediction}"
     )
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
-def tx_to_dataframe(tx: Transaction) -> "pd.DataFrame":
+def tx_to_array(tx: Transaction) -> np.ndarray:
     """
-    Convierte el objeto Pydantic a un DataFrame con el orden EXACTO
-    en que fue entrenado el modelo: [Time, V1..V28, Amount]
-    ⚠️ Verificado inspeccionando modelo_fraude_semana5.pkl directamente.
-    Minería de Datos: el orden debe coincidir exactamente con el
-    que se usó al entrenar (fit) el Random Forest.
+    Orden EXACTO verificado en modelo_fraude_semana5.pkl:
+    [Time, V1..V28, Amount] — sin pandas, numpy puro.
     """
-    import pandas as pd
-    data = {
-        "Time": tx.Time,
-        "V1":  tx.V1,  "V2":  tx.V2,  "V3":  tx.V3,  "V4":  tx.V4,
-        "V5":  tx.V5,  "V6":  tx.V6,  "V7":  tx.V7,  "V8":  tx.V8,
-        "V9":  tx.V9,  "V10": tx.V10, "V11": tx.V11, "V12": tx.V12,
-        "V13": tx.V13, "V14": tx.V14, "V15": tx.V15, "V16": tx.V16,
-        "V17": tx.V17, "V18": tx.V18, "V19": tx.V19, "V20": tx.V20,
-        "V21": tx.V21, "V22": tx.V22, "V23": tx.V23, "V24": tx.V24,
-        "V25": tx.V25, "V26": tx.V26, "V27": tx.V27, "V28": tx.V28,
-        "Amount": tx.Amount,
-    }
-    return pd.DataFrame([data])
+    return np.array([[
+        tx.Time,
+        tx.V1,  tx.V2,  tx.V3,  tx.V4,  tx.V5,  tx.V6,  tx.V7,
+        tx.V8,  tx.V9,  tx.V10, tx.V11, tx.V12, tx.V13, tx.V14,
+        tx.V15, tx.V16, tx.V17, tx.V18, tx.V19, tx.V20, tx.V21,
+        tx.V22, tx.V23, tx.V24, tx.V25, tx.V26, tx.V27, tx.V28,
+        tx.Amount
+    ]])
 
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
@@ -123,24 +104,13 @@ def root():
 
 @app.post("/predict", tags=["Predicción"])
 def predict(tx: Transaction):
-    """
-    Recibe una transacción, predice fraude (1) o legítima (0),
-    persiste el resultado con audit_hash en PostgreSQL.
-    """
-    # 1. Preparar features (orden Time, V1..V28, Amount — verificado en .pkl)
-    features = tx_to_dataframe(tx)
-
-    # 2. Predicción
+    """Recibe transacción, predice fraude, persiste con audit_hash."""
+    features   = tx_to_array(tx)
     prediction = int(model.predict(features)[0])
-    proba      = float(model.predict_proba(features)[0][1])  # prob. de fraude
-
-    # 3. Timestamp actual (UTC)
-    ts = datetime.now(timezone.utc)
-
-    # 4. Calcular audit_hash (Seguridad de BD - SHA-256)
+    proba      = float(model.predict_proba(features)[0][1])
+    ts         = datetime.now(timezone.utc)
     audit_hash = compute_audit_hash(tx, prediction, ts)
 
-    # 5. Persistir en PostgreSQL
     try:
         with engine.connect() as conn:
             conn.execute(text("""
@@ -160,23 +130,20 @@ def predict(tx: Transaction):
         raise HTTPException(status_code=500, detail=f"Error al guardar en BD: {e}")
 
     return {
-        "prediction":      prediction,
-        "label":           "FRAUDE" if prediction == 1 else "LEGÍTIMA",
+        "prediction":        prediction,
+        "label":             "FRAUDE" if prediction == 1 else "LEGÍTIMA",
         "fraud_probability": round(proba, 4),
-        "audit_hash":      audit_hash,
-        "timestamp":       ts.isoformat(),
+        "audit_hash":        audit_hash,
+        "timestamp":         ts.isoformat(),
     }
 
 
 @app.get("/stats", tags=["Monitoreo"])
 def stats():
-    """Resumen rápido para monitorear desde Looker Studio o terminal."""
+    """Resumen para monitoreo."""
     with engine.connect() as conn:
         row = conn.execute(text("""
-            SELECT
-                COUNT(*)                            AS total,
-                SUM(prediction)                     AS fraudes,
-                ROUND(AVG(amount)::NUMERIC, 2)      AS monto_promedio
+            SELECT COUNT(*), SUM(prediction), ROUND(AVG(amount)::NUMERIC, 2)
             FROM fraud_logs
         """)).fetchone()
     return {
